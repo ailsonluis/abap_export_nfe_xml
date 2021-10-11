@@ -1,0 +1,307 @@
+ 
+report zexport_xml.
+
+tables: j_1bnfe_active.
+
+data: it_j_1bnfe_active type standard table of j_1bnfe_active,
+      wa_j_1bnfe_active type j_1bnfe_active,
+      p_pathname        type string.
+
+select-options: s_data for j_1bnfe_active-credat obligatory,
+                s_model for j_1bnfe_active-model,
+                s_direct for j_1bnfe_active-direct.
+
+
+
+
+selection-screen : begin of block b0 with frame title text-000 .
+parameters: p_0   radiobutton group rad1 default 'X' user-command comand1.
+parameters: p_1   radiobutton group rad1 .
+parameters: p_path type string.
+selection-screen : end of block b0 .
+
+at selection-screen on value-request for p_path.
+  cl_gui_frontend_services=>directory_browse( changing selected_folder = p_path ).
+
+
+
+
+start-of-selection.
+  if p_1 eq abap_true.
+    if p_path is initial.
+      message | Informe o diretório local! | type 'I' display like 'E'.
+      exit.
+    endif.
+  endif.
+
+  " Busca as NF's a serem exportadas
+  perform f_busca_nf.
+  perform f_exporta_xml.
+
+
+form f_busca_nf .
+  select * from j_1bnfe_active
+        into table it_j_1bnfe_active
+        where credat in s_data
+        and direct in s_direct
+        and model in s_model.
+
+endform.
+
+form f_exporta_xml .
+
+  data: lo_download       type ref to cl_j_1bnfe_xml_download,
+        lo_ixml           type ref to if_ixml,
+        lo_stream_factory type ref to if_ixml_stream_factory,
+        lo_doc            type ref to if_ixml_document,
+        lo_node_col       type ref to if_ixml_node_collection,
+        lo_node           type ref to if_ixml_node.
+
+  data: l_rfcdest    type rfcdest,
+        l_xnfeactive type j_1bxnfeactive,
+        l_xml        type xstring,
+        l_key        type j_1b_nfe_access_key,
+        l_xml_cont   type j_1b_nfe_xml_content.
+
+  data: v_file             type string.
+  data lo_parser type ref to if_ixml_parser.
+  data lt_solix_tab type table of solix-line.
+  data lv_dir_interface type string.
+
+  data: lv_msg_erro  type string,
+        lv_erro      type abap_bool,
+        lv_tpmodel   type j_1b_nfe_doctype,
+        lv_direction type j_1b_nfe_direction.
+
+  constants   lc_model_nfe  type j_1b_nfe_doctype value 'NFE'.
+  constants   lc_model_cte  type j_1b_nfe_doctype value 'CTE'.
+  constants lc_direct_out type j_1b_nfe_direction value 'OUTB'.
+  constants lc_direct_in type j_1b_nfe_direction value 'INBD'.
+
+  if it_j_1bnfe_active[] is not initial.
+
+    write: 'Iniciando processamento...'.
+    data: lv_acckey type j_1b_nfe_access_key_dtel44.
+
+    loop at it_j_1bnfe_active into wa_j_1bnfe_active.
+
+      " Para notas fiscais de entrada pegaremos somente as que foram autorizadas, para as saidas pegaremos todas as NF's
+      if wa_j_1bnfe_active-direct = 1.
+        if not wa_j_1bnfe_active-docsta eq 1.
+          continue.
+        endif.
+      endif.
+
+
+      if wa_j_1bnfe_active-model eq 55.
+        lv_tpmodel = lc_model_nfe.
+      else.
+        lv_tpmodel = lc_model_cte.
+      endif.
+
+
+      case wa_j_1bnfe_active-direct.
+        when '1'.
+          " Check if flaged as 'entrada' and chage direction if needed
+          select single entrad
+            from j_1bnfdoc
+            into @data(lv_docentrad)
+            where docnum = @wa_j_1bnfe_active-docnum.
+          if lv_docentrad = abap_true.
+            lv_direction = lc_direct_out.
+          else.
+            lv_direction = lc_direct_in.
+          endif.
+        when '2'.
+          lv_direction = lc_direct_out.
+      endcase.
+
+
+      concatenate wa_j_1bnfe_active-regio
+                  wa_j_1bnfe_active-nfyear
+                  wa_j_1bnfe_active-nfmonth
+                  wa_j_1bnfe_active-stcd1
+                  wa_j_1bnfe_active-model
+                  wa_j_1bnfe_active-serie
+                  wa_j_1bnfe_active-nfnum9
+                  wa_j_1bnfe_active-docnum9
+                  wa_j_1bnfe_active-cdv
+                into lv_acckey.
+
+      "WRITE: /, 'ACCESSKEY: ', lv_acckey.
+
+      call function 'J_1B_NFE_CHECK_RFC_DESTINATION'
+        exporting
+          i_bukrs      = wa_j_1bnfe_active-bukrs
+          i_branch     = wa_j_1bnfe_active-branch
+          i_model      = wa_j_1bnfe_active-model
+        importing
+          e_rfcdest    = l_rfcdest
+          e_xnfeactive = l_xnfeactive
+        exceptions
+          rfc_error    = 1
+          others       = 2.
+
+      if sy-subrc ne 0 .
+        write : / | { lv_acckey } - Não foi possível obter o XML, erro na conexão { l_rfcdest } |.
+        continue.
+      endif.
+
+      create object lo_download
+        exporting
+          iv_xml_key = lv_acckey
+          iv_rfc     = l_rfcdest.
+
+
+      "Verificar se o XML existe no GRC:
+
+      data lo_xml_download type ref to cl_j_1bnfe_xml_download_da.
+      data lt_messages     type bapirettab.
+
+      create object lo_xml_download.
+      try.
+
+          lo_xml_download->xml_read(
+            exporting
+                iv_xml_key   = lv_acckey
+                iv_direction = lv_direction
+                iv_doctype   = lv_tpmodel
+                iv_rfc_dest  = l_rfcdest
+            importing
+                et_messages  = lt_messages
+                ev_xml       = l_xml_cont
+            ).
+
+          "RFC connection failure
+        catch cx_j1bnfe_rfc_conn .
+          "Messages from GRC
+        catch cx_j1bnfe_messages .
+
+
+      endtry.
+      if l_xml_cont is initial.
+        write : / | { lv_acckey } - Não foi possível obter o XML. |.
+        continue.
+
+      endif.
+
+      call method lo_download->load_xml_content
+        exporting
+          iv_docnum    = wa_j_1bnfe_active-docnum
+          iv_direction = lv_direction
+          iv_doctype   = lv_tpmodel.
+
+      l_xml_cont = lo_download->get_xml_content( ).
+
+      if l_xml_cont is not initial.
+        data: lo_dom  type ref to if_ixml_document,
+              lv_xml  type xstring,
+              lv_size type i.
+
+        call function 'SDIXML_XML_TO_DOM'
+          exporting
+            xml           = l_xml_cont
+          importing
+            document      = lo_dom
+          exceptions
+            invalid_input = 1
+            others        = 2.
+        if lo_dom is not initial.
+          call function 'SDIXML_DOM_TO_XML'
+            exporting
+              document      = lo_dom
+              pretty_print  = 'X'
+            importing
+              xml_as_string = lv_xml
+              size          = lv_size
+              "tables
+           "  xml_as_table  =
+            exceptions
+              no_document   = 1
+              others        = 2.
+          if sy-subrc <> 0.
+*                    message id sy-msgid type sy-msgty number sy-msgno
+*                               with sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+          endif.
+
+        endif.
+      endif.
+
+
+      call function 'SCMS_XSTRING_TO_BINARY'
+        exporting
+          buffer     = lv_xml
+*         APPEND_TO_TABLE       = ' '
+*       IMPORTING
+*         OUTPUT_LENGTH         =
+        tables
+          binary_tab = lt_solix_tab.
+
+      case wa_j_1bnfe_active-direct.
+        when '1'. " NF Entrada
+          lv_dir_interface = 'inbound'.
+        when '2'. " NF Saida
+          lv_dir_interface = 'outbound'.
+        when '3'. " Devoluções de saida de transferencia de estoque
+          lv_dir_interface = 'inbound'.
+        when '4'. " Devoluções de entrada de transferencia de estoque
+          lv_dir_interface = 'outbound'.
+        when others.
+          lv_dir_interface = 'outbound'.
+      endcase.
+
+
+      "salvar no servidor
+      if p_0 eq abap_true.
+        data(lv_path_srv) = '\usr\caminho\'.
+        v_file = |{ lv_path_srv }\\{ sy-sysid }\\{ lv_dir_interface }\\{ lv_acckey }.xml|.
+
+        open dataset v_file for output in binary mode.
+        if sy-subrc <> 0.
+          concatenate lv_msg_erro 'Falha na abertura do arquivo para gravação' into lv_msg_erro respecting blanks.
+          "lv_erro = abap_true.
+          write: /, lv_acckey, ' - Falha ao abrir o arquivo para leitura'.
+          continue.
+        else.
+          TRANSFER lv_xml to v_file.
+
+          close dataset v_file.
+           if sy-subrc eq 0.
+          write : / | { lv_acckey } - exportado! |.
+
+        endif.
+        endif.
+      endif.
+
+      "Salva no computador local
+      if p_1 eq abap_true.
+        v_file = |{ p_path }\\{ sy-sysid }\\{ lv_dir_interface }\\{ lv_acckey }.xml|.
+
+        "salvar em pasta local
+        call method cl_gui_frontend_services=>gui_download
+          exporting
+            filename     = v_file
+            filetype     = 'BIN'
+            bin_filesize = lv_size
+          changing
+            data_tab     = lt_solix_tab
+          exceptions
+            others       = 24.
+
+        if sy-subrc eq 0.
+          write : / | { lv_acckey } - exportado! |.
+
+        endif.
+      endif.
+
+
+
+    endloop.
+
+    write: /, 'Processamento finalizado!'.
+
+  else.
+    write: /, 'Nenhuma NF a ser exportada'.
+  endif.
+
+endform.
